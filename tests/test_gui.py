@@ -1,12 +1,14 @@
 import os
+import queue
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtWidgets import QApplication
 
 from midi_ptt_controller.config import AppConfig, BackendConfig, ConfigStore, MidiConfig
@@ -15,6 +17,9 @@ from midi_ptt_controller import gui
 
 
 class _Midi:
+    def __init__(self):
+        self.pending = queue.Queue()
+
     def get_input_names(self):
         return ["Pedal"]
 
@@ -22,10 +27,18 @@ class _Midi:
         return self
 
     def read(self, _port):
-        return []
+        messages = []
+        while True:
+            try:
+                messages.append(self.pending.get_nowait())
+            except queue.Empty:
+                return messages
 
     def close(self, _port):
         pass
+
+    def send(self, message):
+        self.pending.put(message)
 
 
 class _Backend:
@@ -54,6 +67,46 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(config.backend.kind, "serial")
         self.assertEqual(config.backend.serial_port, "COM3")
         dialog.close()
+
+    def test_detection_result_selects_cc_controller(self):
+        dialog = gui.SettingsDialog(AppConfig())
+        with patch.object(gui.QMessageBox, "information"):
+            dialog._finish_detection(("Pedal", 4, "cc", 21))
+        self.assertEqual(dialog.device.currentData(), "Pedal")
+        self.assertEqual(dialog.channel.currentData(), 4)
+        self.assertEqual(dialog.midi_mode.currentData(), "cc")
+        self.assertEqual(dialog.controller.value(), 21)
+        dialog.serial_port.setText("COM3")
+        config = dialog.make_config()
+        self.assertEqual(config.midi.mode, "cc")
+        self.assertEqual(config.midi.controller, 21)
+        self.assertEqual(config.midi.channel, 4)
+        dialog.close()
+
+    def test_detect_button_reads_real_mido_cc_and_updates_dialog(self):
+        midi = _Midi()
+        engine = PttEngine(AppConfig(), backend_factory=lambda _config: _Backend(), midi_input=midi)
+        engine.start()
+        dialog = gui.SettingsDialog(AppConfig(), engine=engine)
+        loop = QEventLoop()
+        dialog._detection_bridge.completed.connect(lambda _result: loop.quit())
+        QTimer.singleShot(
+            50,
+            lambda: midi.send(
+                SimpleNamespace(type="control_change", control=23, value=91, channel=2)
+            ),
+        )
+        with patch.object(gui.QMessageBox, "information"):
+            dialog.detect_button.click()
+            QTimer.singleShot(2000, loop.quit)
+            loop.exec()
+        self.assertEqual(dialog.device.currentData(), "Pedal")
+        self.assertEqual(dialog.channel.currentData(), 3)
+        self.assertEqual(dialog.midi_mode.currentData(), "cc")
+        self.assertEqual(dialog.controller.value(), 23)
+        self.assertTrue(dialog.detect_button.isEnabled())
+        dialog.close()
+        engine.stop()
 
     def test_dashboard_starts_and_stops_without_hardware(self):
         config = AppConfig(

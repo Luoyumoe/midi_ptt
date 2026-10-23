@@ -10,7 +10,7 @@ import threading
 from datetime import datetime
 from typing import Any
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
@@ -42,6 +42,10 @@ from .engine import PttEngine, PttStatus
 LOG = logging.getLogger(__name__)
 
 
+class _DetectionBridge(QObject):
+    completed = Signal(object)
+
+
 def _midi_names() -> list[str]:
     try:
         import mido
@@ -52,11 +56,23 @@ def _midi_names() -> list[str]:
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, config: AppConfig, parent: QWidget | None = None):
+    def __init__(
+        self,
+        config: AppConfig,
+        parent: QWidget | None = None,
+        *,
+        engine: PttEngine | None = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("MIDI / PTT 设置向导")
         self.setMinimumWidth(460)
         self._original = config
+        self._detection_bridge = _DetectionBridge(self)
+        self._detection_bridge.completed.connect(self._finish_detection)
+        self.finished.connect(self._cancel_detection)
+        self._engine = engine or getattr(parent, "engine", None)
+        self._detect_engine: PttEngine | None = None
+        self._detect_cancelled = threading.Event()
         form = QFormLayout()
 
         self.device = QComboBox()
@@ -182,21 +198,41 @@ class SettingsDialog(QDialog):
         self.detect_button.setEnabled(False)
         self.detect_button.setText("等待按键…")
         # Engine reads MIDI on its worker; detection must not block Qt UI.
-        engine = getattr(self.parent(), "engine", None)
+        engine = self._engine
         if engine is None:
             self._finish_detection(RuntimeError("MIDI 引擎未运行"))
             return
-        thread = threading.Thread(target=self._detect_worker, args=(engine,), daemon=True)
+        self._detect_engine = engine
+        self._detect_cancelled.clear()
+        selected_device = self.device.currentData()
+        if not selected_device:
+            typed_name = self.device.currentText().strip()
+            if typed_name != "请选择 MIDI 输入设备":
+                selected_device = typed_name
+        thread = threading.Thread(
+            target=self._detect_worker,
+            args=(engine, str(selected_device or "")),
+            daemon=True,
+        )
         thread.start()
 
-    def _detect_worker(self, engine: PttEngine) -> None:
+    def _detect_worker(self, engine: PttEngine, device_name: str) -> None:
         try:
-            result = engine.detect_midi(timeout=15.0)
-            QTimer.singleShot(0, lambda: self._finish_detection(result))
+            result = engine.detect_midi(timeout=15.0, device_name=device_name)
+            if not self._detect_cancelled.is_set():
+                self._detection_bridge.completed.emit(result)
         except BaseException as exc:
-            QTimer.singleShot(0, lambda: self._finish_detection(exc))
+            if not self._detect_cancelled.is_set():
+                self._detection_bridge.completed.emit(exc)
+
+    def _cancel_detection(self, *_args: Any) -> None:
+        self._detect_cancelled.set()
+        if self._detect_engine is not None:
+            self._detect_engine.cancel_detection()
+            self._detect_engine = None
 
     def _finish_detection(self, result: Any) -> None:
+        self._detect_engine = None
         self.detect_button.setEnabled(True)
         self.detect_button.setText("按下检测按键")
         if isinstance(result, BaseException):
@@ -400,7 +436,7 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         if self._settings_pending:
             return
-        dialog = SettingsDialog(self.config, self)
+        dialog = SettingsDialog(self.config, self, engine=self.engine)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:

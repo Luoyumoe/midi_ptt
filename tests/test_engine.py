@@ -34,9 +34,18 @@ class FakeMidi:
     def close(self, _port):
         pass
 
-    def send(self, kind, *, note=60, control=0, velocity=127, channel=0):
+    def send(self, kind, *, note=60, control=0, value=None, velocity=127, channel=0):
+        if value is None:
+            value = velocity
         self.pending.put(
-            SimpleNamespace(type=kind, note=note, control=control, velocity=velocity, channel=channel)
+            SimpleNamespace(
+                type=kind,
+                note=note,
+                control=control,
+                value=value,
+                velocity=velocity,
+                channel=channel,
+            )
         )
 
 
@@ -174,9 +183,9 @@ class EngineTests(unittest.TestCase):
         )
         self.engine.start()
         self.assertTrue(wait_for(lambda: self.engine.snapshot().midi_connected))
-        self.midi.send("control_change", control=12, velocity=64)
+        self.midi.send("control_change", control=12, value=64)
         self.assertTrue(wait_for(lambda: self.engine.snapshot().ptt_applied is True))
-        self.midi.send("control_change", control=12, velocity=0)
+        self.midi.send("control_change", control=12, value=0)
         self.assertTrue(wait_for(lambda: self.engine.snapshot().ptt_applied is False))
 
     def test_detect_control_works_before_setup_is_complete(self):
@@ -196,11 +205,25 @@ class EngineTests(unittest.TestCase):
             )
             thread.start()
             self.assertTrue(wait_for(lambda: detector.snapshot().midi_connected))
-            self.midi.send("control_change", control=23, velocity=80, channel=2)
+            self.midi.send("control_change", control=23, value=0, channel=2)
             thread.join(2.0)
             self.assertEqual(result_box, [("Pedal", 3, "cc", 23)])
+            self.assertTrue(wait_for(lambda: not detector.snapshot().midi_connected))
         finally:
             detector.stop()
+
+    def test_detection_press_does_not_assert_ptt(self):
+        result_box = []
+        thread = __import__("threading").Thread(
+            target=lambda: result_box.append(self.engine.detect_midi(timeout=2.0, device_name="Pedal")),
+            daemon=True,
+        )
+        thread.start()
+        self.assertTrue(wait_for(lambda: self.engine._detect_request is not None))
+        self.midi.send("note_on", note=60, velocity=127)
+        thread.join(2.0)
+        self.assertEqual(result_box, [("Pedal", 1, "note", 60)])
+        self.assertFalse(self.backend.enabled)
 
     def test_switch_while_pedal_down_never_transfers_ptt(self):
         replacement = FakeBackend()

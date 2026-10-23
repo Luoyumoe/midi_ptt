@@ -163,29 +163,26 @@ class PttEngine:
         """Inject an input event; intended for simulator and deterministic tests."""
         self._commands.put(("midi", message))
 
-    def detect_midi(self, timeout: float = 10.0) -> tuple[str, int, str, int]:
+    def detect_midi(
+        self, timeout: float = 10.0, device_name: str = ""
+    ) -> tuple[str, int, str, int]:
         """Wait for next MIDI Note/CC event; returns device, channel, mode, value."""
         if not self._thread or not self._thread.is_alive():
             raise RuntimeError("MIDI engine is not running")
         result = threading.Event()
         answer: list[Any] = []
-        device_name = ""
-        if not self._midi_connected:
-            try:
-                names = self._midi.get_input_names()
-            except Exception as exc:
-                raise RuntimeError(f"无法读取 MIDI 设备：{exc}") from exc
-            if not names:
-                raise RuntimeError("未发现 MIDI 输入设备")
-            device_name = names[0]
         self._commands.put(("detect", result, answer, device_name))
         if not result.wait(timeout):
+            self._commands.put(("cancel_detect", result))
             raise TimeoutError("Timed out waiting for MIDI control event")
         if answer and isinstance(answer[0], BaseException):
             raise answer[0]
         if not answer:
             raise RuntimeError("MIDI detection failed")
         return answer[0]
+
+    def cancel_detection(self) -> None:
+        self._commands.put(("cancel_detect", None))
 
     def update_config(self, config: AppConfig, timeout: float = 65.0) -> None:
         config.validate()
@@ -273,7 +270,9 @@ class PttEngine:
             self._disconnect_midi(f"MIDI scan failed: {exc}")
             return
         wanted = self._detect_device or self.config.midi.device_name
-        if self._midi_port is not None and (wanted not in names or not self._midi_connected):
+        if self._midi_port is not None and (
+            wanted not in names or wanted != self._connected_midi_name or not self._midi_connected
+        ):
             self._disconnect_midi("MIDI input disconnected")
         if self._midi_port is None and wanted in names:
             try:
@@ -327,18 +326,23 @@ class PttEngine:
             return
         if msg_type == "control_change":
             value = int(getattr(message, "control", -1))
+            cc_value = int(getattr(message, "value", velocity))
             if self._detect_request is not None and 0 <= value <= 127:
                 event, answer = self._detect_request
                 answer.append((self._connected_midi_name or self.config.midi.device_name, channel, "cc", value))
                 self._detect_request = None
+                self._detect_device = ""
                 event.set()
                 self._emit("info", f"MIDI detected: CC {value}, channel {channel}")
+                if not self.config.setup_complete:
+                    self._close_midi()
+                return
             current_match = self.config.midi.mode == "cc" and value == self.config.midi.controller and (
                 self.config.midi.channel is None or channel == self.config.midi.channel
             )
             if not current_match:
                 return
-            self._apply_pedal_event(velocity > 0, True)
+            self._apply_pedal_event(cc_value > 0, True)
             return
         if msg_type not in {"note_on", "note_off"}:
             return
@@ -346,12 +350,16 @@ class PttEngine:
             note = int(message.note)
         except (AttributeError, TypeError, ValueError):
             return
-        if self._detect_request is not None:
+        if self._detect_request is not None and msg_type == "note_on" and velocity > 0:
             event, answer = self._detect_request
             answer.append((self._connected_midi_name or self.config.midi.device_name, channel, "note", note))
             self._detect_request = None
+            self._detect_device = ""
             event.set()
             self._emit("info", f"MIDI detected: Note {note}, channel {channel}")
+            if not self.config.setup_complete:
+                self._close_midi()
+            return
         if self.config.midi.mode != "note":
             return
         current_match = note == self.config.midi.note and (
@@ -401,7 +409,32 @@ class PttEngine:
                 self._handle_midi(command[1])
             elif kind == "detect":
                 self._detect_request = (command[1], command[2])
-                self._detect_device = command[3] if len(command) > 3 else ""
+                requested_device = command[3] if len(command) > 3 else ""
+                self._detect_device = (
+                    requested_device or self._connected_midi_name or self.config.midi.device_name
+                )
+                if not self._detect_device and not self._midi_connected:
+                    try:
+                        names = self._midi.get_input_names()
+                    except Exception as exc:
+                        self._detect_request[1].append(RuntimeError(f"无法读取 MIDI 设备：{exc}"))
+                        self._detect_request[0].set()
+                        self._detect_request = None
+                    else:
+                        if names:
+                            self._detect_device = names[0]
+                        else:
+                            self._detect_request[1].append(RuntimeError("未发现 MIDI 输入设备"))
+                            self._detect_request[0].set()
+                            self._detect_request = None
+            elif kind == "cancel_detect":
+                if self._detect_request is not None and (
+                    command[1] is None or self._detect_request[0] is command[1]
+                ):
+                    self._detect_request[1].append(RuntimeError("MIDI detection cancelled"))
+                    self._detect_request[0].set()
+                    self._detect_request = None
+                    self._detect_device = ""
             elif kind == "configure":
                 _, config, result, answer = command
                 try:
