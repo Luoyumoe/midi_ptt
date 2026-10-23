@@ -179,6 +179,29 @@ class EngineTests(unittest.TestCase):
         self.midi.send("control_change", control=12, velocity=0)
         self.assertTrue(wait_for(lambda: self.engine.snapshot().ptt_applied is False))
 
+    def test_detect_control_works_before_setup_is_complete(self):
+        self.engine.stop()
+        detector = PttEngine(
+            AppConfig(),
+            backend_factory=lambda _config: self.backend,
+            midi_input=self.midi,
+            poll_interval=0.005,
+            scan_interval=0.02,
+        )
+        detector.start()
+        try:
+            result_box = []
+            thread = __import__("threading").Thread(
+                target=lambda: result_box.append(detector.detect_midi(timeout=2.0)), daemon=True
+            )
+            thread.start()
+            self.assertTrue(wait_for(lambda: detector.snapshot().midi_connected))
+            self.midi.send("control_change", control=23, velocity=80, channel=2)
+            thread.join(2.0)
+            self.assertEqual(result_box, [("Pedal", 3, "cc", 23)])
+        finally:
+            detector.stop()
+
     def test_switch_while_pedal_down_never_transfers_ptt(self):
         replacement = FakeBackend()
         old = self.backend

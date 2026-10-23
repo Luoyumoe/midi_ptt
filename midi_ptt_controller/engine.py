@@ -88,6 +88,7 @@ class PttEngine:
         self._backend_connected = False
         self._midi_port: Any | None = None
         self._midi_connected = False
+        self._connected_midi_name = ""
         self._pedal_down = False
         self._suppress_until_release = False
         self._release_mapping: tuple[int | None, int | None] | None = None
@@ -100,6 +101,7 @@ class PttEngine:
         self._last_backend_attempt = 0.0
         self._last_off_attempt = 0.0
         self._detect_request: tuple[threading.Event, list[Any]] | None = None
+        self._detect_device = ""
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -167,7 +169,16 @@ class PttEngine:
             raise RuntimeError("MIDI engine is not running")
         result = threading.Event()
         answer: list[Any] = []
-        self._commands.put(("detect", result, answer))
+        device_name = ""
+        if not self._midi_connected:
+            try:
+                names = self._midi.get_input_names()
+            except Exception as exc:
+                raise RuntimeError(f"无法读取 MIDI 设备：{exc}") from exc
+            if not names:
+                raise RuntimeError("未发现 MIDI 输入设备")
+            device_name = names[0]
+        self._commands.put(("detect", result, answer, device_name))
         if not result.wait(timeout):
             raise TimeoutError("Timed out waiting for MIDI control event")
         if answer and isinstance(answer[0], BaseException):
@@ -227,6 +238,7 @@ class PttEngine:
                 event.set()
             self._shutdown_backend()
             self._close_midi()
+            self._detect_device = ""
             self._applied = False if self._applied is not None else None
             self._publish()
             self._emit("info", "PTT engine stopped")
@@ -249,7 +261,8 @@ class PttEngine:
             self._last_backend_attempt = time.monotonic()
 
     def _scan_midi(self, now: float) -> None:
-        if not self.config.setup_complete or not self.config.midi.device_name:
+        detecting = self._detect_request is not None or bool(self._detect_device)
+        if not detecting and (not self.config.setup_complete or not self.config.midi.device_name):
             return
         if now - self._last_scan < self._scan_interval:
             return
@@ -259,13 +272,14 @@ class PttEngine:
         except Exception as exc:
             self._disconnect_midi(f"MIDI scan failed: {exc}")
             return
-        wanted = self.config.midi.device_name
+        wanted = self._detect_device or self.config.midi.device_name
         if self._midi_port is not None and (wanted not in names or not self._midi_connected):
             self._disconnect_midi("MIDI input disconnected")
         if self._midi_port is None and wanted in names:
             try:
                 self._midi_port = self._midi.open_input(wanted)
                 self._midi_connected = True
+                self._connected_midi_name = wanted
                 self._emit("info", f"MIDI input connected: {wanted}")
                 self._pedal_down = False
             except Exception as exc:
@@ -315,7 +329,7 @@ class PttEngine:
             value = int(getattr(message, "control", -1))
             if self._detect_request is not None and 0 <= value <= 127:
                 event, answer = self._detect_request
-                answer.append((self.config.midi.device_name, channel, "cc", value))
+                answer.append((self._connected_midi_name or self.config.midi.device_name, channel, "cc", value))
                 self._detect_request = None
                 event.set()
                 self._emit("info", f"MIDI detected: CC {value}, channel {channel}")
@@ -334,7 +348,7 @@ class PttEngine:
             return
         if self._detect_request is not None:
             event, answer = self._detect_request
-            answer.append((self.config.midi.device_name, channel, "note", note))
+            answer.append((self._connected_midi_name or self.config.midi.device_name, channel, "note", note))
             self._detect_request = None
             event.set()
             self._emit("info", f"MIDI detected: Note {note}, channel {channel}")
@@ -387,6 +401,7 @@ class PttEngine:
                 self._handle_midi(command[1])
             elif kind == "detect":
                 self._detect_request = (command[1], command[2])
+                self._detect_device = command[3] if len(command) > 3 else ""
             elif kind == "configure":
                 _, config, result, answer = command
                 try:
@@ -584,6 +599,7 @@ class PttEngine:
                 self._emit("warning", f"MIDI input close failed: {exc}")
         self._midi_port = None
         self._midi_connected = False
+        self._connected_midi_name = ""
 
     def stop(self, timeout: float = 100.0) -> None:
         if self._thread is None:
