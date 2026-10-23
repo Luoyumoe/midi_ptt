@@ -75,7 +75,22 @@ class SettingsDialog(QDialog):
         self.note = QSpinBox()
         self.note.setRange(0, 127)
         self.note.setValue(config.midi.note if config.midi.note is not None else 60)
-        form.addRow("Note 编号", self.note)
+        self.controller = QSpinBox()
+        self.controller.setRange(0, 127)
+        self.controller.setValue(config.midi.controller if config.midi.controller is not None else 0)
+        self.midi_mode = QComboBox()
+        self.midi_mode.addItem("Note 踏板", "note")
+        self.midi_mode.addItem("CC 控制器", "cc")
+        self.midi_mode.setCurrentIndex(max(0, self.midi_mode.findData(config.midi.mode)))
+        self.detect_button = QPushButton("按下检测按键")
+        self.detect_button.setToolTip("按下 MIDI 踏板或控制器，自动识别设备、通道和编号")
+        self.detect_button.clicked.connect(self._detect_midi)
+        midi_row = QHBoxLayout()
+        midi_row.addWidget(self.midi_mode)
+        midi_row.addWidget(self.note)
+        midi_row.addWidget(self.controller)
+        midi_row.addWidget(self.detect_button)
+        form.addRow("MIDI 控件", midi_row)
         self.channel = QComboBox()
         self.channel.addItem("任意通道", None)
         for channel in range(1, 17):
@@ -137,6 +152,8 @@ class SettingsDialog(QDialog):
         self._form = form
         self.backend_kind.currentIndexChanged.connect(self._update_backend_fields)
         self._update_backend_fields()
+        self.midi_mode.currentIndexChanged.connect(self._update_midi_fields)
+        self._update_midi_fields()
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -155,6 +172,46 @@ class SettingsDialog(QDialog):
         for label, widget in self._rows:
             self._form.labelForField(widget).setVisible(label in visible)
             widget.setVisible(label in visible)
+
+    def _update_midi_fields(self) -> None:
+        is_note = self.midi_mode.currentData() == "note"
+        self.note.setVisible(is_note)
+        self.controller.setVisible(not is_note)
+
+    def _detect_midi(self) -> None:
+        self.detect_button.setEnabled(False)
+        self.detect_button.setText("等待按键…")
+        # Engine reads MIDI on its worker; detection must not block Qt UI.
+        engine = getattr(self.parent(), "engine", None)
+        if engine is None:
+            self._finish_detection(RuntimeError("MIDI 引擎未运行"))
+            return
+        thread = threading.Thread(target=self._detect_worker, args=(engine,), daemon=True)
+        thread.start()
+
+    def _detect_worker(self, engine: PttEngine) -> None:
+        try:
+            result = engine.detect_midi(timeout=15.0)
+            QTimer.singleShot(0, lambda: self._finish_detection(result))
+        except BaseException as exc:
+            QTimer.singleShot(0, lambda: self._finish_detection(exc))
+
+    def _finish_detection(self, result: Any) -> None:
+        self.detect_button.setEnabled(True)
+        self.detect_button.setText("按下检测按键")
+        if isinstance(result, BaseException):
+            QMessageBox.warning(self, "MIDI 检测", str(result))
+            return
+        device, channel, mode, value = result
+        index = self.device.findData(device)
+        if index < 0:
+            self.device.addItem(device, device)
+            index = self.device.count() - 1
+        self.device.setCurrentIndex(index)
+        self.channel.setCurrentIndex(self.channel.findData(channel))
+        self.midi_mode.setCurrentIndex(self.midi_mode.findData(mode))
+        (self.note if mode == "note" else self.controller).setValue(value)
+        QMessageBox.information(self, "MIDI 检测", f"已选中 {mode.upper()} {value}，通道 {channel}")
 
     def make_config(self) -> AppConfig:
         kind = self.backend_kind.currentData()
@@ -177,7 +234,9 @@ class SettingsDialog(QDialog):
             device_name = self.device.currentText().strip()
         midi = MidiConfig(
             device_name=device_name,
+            mode=self.midi_mode.currentData(),
             note=self.note.value(),
+            controller=self.controller.value(),
             channel=self.channel.currentData(),
         )
         config = AppConfig(

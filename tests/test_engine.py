@@ -34,8 +34,10 @@ class FakeMidi:
     def close(self, _port):
         pass
 
-    def send(self, kind, *, note=60, velocity=127, channel=0):
-        self.pending.put(SimpleNamespace(type=kind, note=note, velocity=velocity, channel=channel))
+    def send(self, kind, *, note=60, control=0, velocity=127, channel=0):
+        self.pending.put(
+            SimpleNamespace(type=kind, note=note, control=control, velocity=velocity, channel=channel)
+        )
 
 
 class FakeBackend:
@@ -163,6 +165,19 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(replacement.connected)
         self.assertFalse(replacement.enabled)
         self.assertFalse(self.engine.snapshot().ptt_applied)
+
+    def test_cc_on_off_controls_ptt(self):
+        self.engine.config = AppConfig(
+            setup_complete=True,
+            midi=MidiConfig("Pedal", mode="cc", controller=12, channel=1),
+            backend=BackendConfig(kind="serial", serial_port="SIM"),
+        )
+        self.engine.start()
+        self.assertTrue(wait_for(lambda: self.engine.snapshot().midi_connected))
+        self.midi.send("control_change", control=12, velocity=64)
+        self.assertTrue(wait_for(lambda: self.engine.snapshot().ptt_applied is True))
+        self.midi.send("control_change", control=12, velocity=0)
+        self.assertTrue(wait_for(lambda: self.engine.snapshot().ptt_applied is False))
 
     def test_switch_while_pedal_down_never_transfers_ptt(self):
         replacement = FakeBackend()

@@ -91,6 +91,7 @@ class PttEngine:
         self._pedal_down = False
         self._suppress_until_release = False
         self._release_mapping: tuple[int | None, int | None] | None = None
+        self._release_mode = "note"
         self._test_until = 0.0
         self._ptt_started: float | None = None
         self._applied: bool | None = False
@@ -98,6 +99,7 @@ class PttEngine:
         self._last_scan = 0.0
         self._last_backend_attempt = 0.0
         self._last_off_attempt = 0.0
+        self._detect_request: tuple[threading.Event, list[Any]] | None = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -159,6 +161,21 @@ class PttEngine:
         """Inject an input event; intended for simulator and deterministic tests."""
         self._commands.put(("midi", message))
 
+    def detect_midi(self, timeout: float = 10.0) -> tuple[str, int, str, int]:
+        """Wait for next MIDI Note/CC event; returns device, channel, mode, value."""
+        if not self._thread or not self._thread.is_alive():
+            raise RuntimeError("MIDI engine is not running")
+        result = threading.Event()
+        answer: list[Any] = []
+        self._commands.put(("detect", result, answer))
+        if not result.wait(timeout):
+            raise TimeoutError("Timed out waiting for MIDI control event")
+        if answer and isinstance(answer[0], BaseException):
+            raise answer[0]
+        if not answer:
+            raise RuntimeError("MIDI detection failed")
+        return answer[0]
+
     def update_config(self, config: AppConfig, timeout: float = 65.0) -> None:
         config.validate()
         result = threading.Event()
@@ -203,6 +220,11 @@ class PttEngine:
             self._emit("critical", self._fault)
         finally:
             self._stop.set()
+            if self._detect_request is not None:
+                event, answer = self._detect_request
+                answer.append(RuntimeError("MIDI engine stopped"))
+                self._detect_request = None
+                event.set()
             self._shutdown_backend()
             self._close_midi()
             self._applied = False if self._applied is not None else None
@@ -264,6 +286,7 @@ class PttEngine:
         self._midi_connected = False
         if was_connected or self._pedal_down:
             mapping = (self.config.midi.note, self.config.midi.channel)
+            self._release_mode = self.config.midi.mode
             self._pedal_down = False
             self._suppress_until_release = True
             self._release_mapping = mapping
@@ -284,22 +307,51 @@ class PttEngine:
     def _handle_midi(self, message: Any) -> None:
         try:
             msg_type = message.type
-            note = int(message.note)
             velocity = int(getattr(message, "velocity", 0))
             channel = int(getattr(message, "channel", 0)) + 1
         except (AttributeError, TypeError, ValueError):
             return
+        if msg_type == "control_change":
+            value = int(getattr(message, "control", -1))
+            if self._detect_request is not None and 0 <= value <= 127:
+                event, answer = self._detect_request
+                answer.append((self.config.midi.device_name, channel, "cc", value))
+                self._detect_request = None
+                event.set()
+                self._emit("info", f"MIDI detected: CC {value}, channel {channel}")
+            current_match = self.config.midi.mode == "cc" and value == self.config.midi.controller and (
+                self.config.midi.channel is None or channel == self.config.midi.channel
+            )
+            if not current_match:
+                return
+            self._apply_pedal_event(velocity > 0, True)
+            return
         if msg_type not in {"note_on", "note_off"}:
+            return
+        try:
+            note = int(message.note)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if self._detect_request is not None:
+            event, answer = self._detect_request
+            answer.append((self.config.midi.device_name, channel, "note", note))
+            self._detect_request = None
+            event.set()
+            self._emit("info", f"MIDI detected: Note {note}, channel {channel}")
+        if self.config.midi.mode != "note":
             return
         current_match = note == self.config.midi.note and (
             self.config.midi.channel is None or channel == self.config.midi.channel
         )
-        release_match = self._release_mapping is not None and note == self._release_mapping[0] and (
+        release_match = self._release_mode == "note" and self._release_mapping is not None and note == self._release_mapping[0] and (
             self._release_mapping[1] is None or channel == self._release_mapping[1]
         )
         if not current_match and not release_match:
             return
         is_down = msg_type == "note_on" and velocity > 0
+        self._apply_pedal_event(is_down, current_match)
+
+    def _apply_pedal_event(self, is_down: bool, current_match: bool) -> None:
         if not is_down:
             was_down = self._pedal_down
             self._pedal_down = False
@@ -333,6 +385,8 @@ class PttEngine:
             kind = command[0]
             if kind == "midi":
                 self._handle_midi(command[1])
+            elif kind == "detect":
+                self._detect_request = (command[1], command[2])
             elif kind == "configure":
                 _, config, result, answer = command
                 try:
@@ -368,6 +422,7 @@ class PttEngine:
         self._release_mapping = (
             (old_config.midi.note, old_config.midi.channel) if was_pedal_down else None
         )
+        self._release_mode = old_config.midi.mode
         self._test_until = 0.0
         if backend_changed:
             if self._backend is not None:

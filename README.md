@@ -21,6 +21,8 @@ python run_app.py --help
 
 首次 GUI 启动会打开设置向导。选 MIDI 输入设备、Note、通道和 PTT 驱动后保存。按住对应 Note 发射，松开停止。Note On 速度为零也视为松开。设置向导可从主窗口或托盘菜单再次打开。
 
+设置向导支持 `Note 踏板` 和 `CC 控制器` 两种 MIDI 控件。选择 `CC 控制器` 后，点击“按下检测按键”，再按一次脚踏或旋钮，程序自动选中 MIDI 设备、通道和 CC 编号。CC 值大于零按下，CC 值为零松开。
+
 ```bash
 python -m midi_ptt_controller.main --minimized
 python -m midi_ptt_controller.main --headless

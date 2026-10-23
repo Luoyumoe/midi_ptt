@@ -19,14 +19,22 @@ class ConfigError(ValueError):
 @dataclass(frozen=True)
 class MidiConfig:
     device_name: str = ""
+    mode: str = "note"  # note or cc
     note: int | None = None
+    controller: int | None = None
     channel: int | None = None  # MIDI channels are stored as 1..16; None means any.
 
     def validate(self) -> None:
         if not isinstance(self.device_name, str):
             raise ConfigError("MIDI device name must be a string")
+        if self.mode not in {"note", "cc"}:
+            raise ConfigError("MIDI mode must be note or cc")
         if self.note is not None and (type(self.note) is not int or not 0 <= self.note <= 127):
             raise ConfigError("MIDI note must be an integer between 0 and 127")
+        if self.controller is not None and (
+            type(self.controller) is not int or not 0 <= self.controller <= 127
+        ):
+            raise ConfigError("MIDI CC controller must be an integer between 0 and 127")
         if self.channel is not None and (
             type(self.channel) is not int or not 1 <= self.channel <= 16
         ):
@@ -94,8 +102,10 @@ class AppConfig:
         if self.setup_complete:
             if not self.midi.device_name.strip():
                 raise ConfigError("Completed setup requires a MIDI device")
-            if self.midi.note is None:
+            if self.midi.mode == "note" and self.midi.note is None:
                 raise ConfigError("Completed setup requires a MIDI note")
+            if self.midi.mode == "cc" and self.midi.controller is None:
+                raise ConfigError("Completed setup requires a MIDI CC controller")
             if self.backend.kind == "none":
                 raise ConfigError("Completed setup requires a PTT backend")
 
